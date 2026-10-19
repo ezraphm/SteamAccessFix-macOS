@@ -79,16 +79,34 @@ def flush_dns():
 
 
 def resolve_doh(host):
+    """All A records for host, cached. Failed IPs are rotated to the back (see demote_ip)."""
     hit = _dns_cache.get(host)
     if hit and hit[1] > time.monotonic():
-        return hit[0]
-    ip = _resolve(host)
-    _dns_cache[host] = (ip, time.monotonic() + DNS_TTL)
-    return ip
+        return list(hit[0])
+    ips = _resolve(host)
+    _dns_cache[host] = (ips, time.monotonic() + DNS_TTL)
+    return list(ips)
+
+
+def demote_ip(host, ip):
+    if (hit := _dns_cache.get(host)) and ip in hit[0] and len(hit[0]) > 1:
+        hit[0].remove(ip)
+        hit[0].append(ip)
+
+
+def keepalive(sock):
+    """Detect dead peers in ~15s + 3s*3 instead of the 2h OS default."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, 15)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 3)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+    except (OSError, AttributeError):
+        pass
 
 
 def dns_query(host, server, timeout=4):
-    """Plain UDP A query; returns first IPv4. Raises on timeout/parse error."""
+    """Plain UDP A query; returns all IPv4 answers. Raises on timeout/parse error/no answer."""
     q = struct.pack(">HHHHHH", random.randint(0, 65535), 0x0100, 1, 0, 0, 0)
     for label in host.split("."):
         q += bytes([len(label)]) + label.encode()
@@ -100,15 +118,18 @@ def dns_query(host, server, timeout=4):
     i = 12
     while r[i]: i += r[i] + 1
     i += 5
+    ips = []
     for _ in range(struct.unpack(">H", r[6:8])[0]):
         if r[i] & 0xC0 == 0xC0: i += 2
         else:
             while r[i]: i += r[i] + 1
             i += 1
         typ, _c, _ttl, rdl = struct.unpack(">HHIH", r[i:i+10]); i += 10
-        if typ == 1: return socket.inet_ntoa(r[i:i+4])
+        if typ == 1: ips.append(socket.inet_ntoa(r[i:i+4]))
         i += rdl
-    raise ValueError("no A record")
+    if not ips:
+        raise ValueError("no A record")
+    return ips
 
 
 def _resolve(host):
@@ -116,7 +137,7 @@ def _resolve(host):
     try:
         return dns_query(host, "8.8.8.8")
     except Exception:
-        return socket.getaddrinfo(host, 443, socket.AF_INET)[0][4][0]
+        return list(dict.fromkeys(a[4][0] for a in socket.getaddrinfo(host, 443, socket.AF_INET)))
 
 
 def fastest_dns():
@@ -208,11 +229,20 @@ async def handle(cr, cw):
             cw.write(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
             return
         host, _, port = line.split()[1].rpartition(":")
-        ip = await asyncio.get_running_loop().run_in_executor(None, resolve_doh, host)
+        ips = await asyncio.get_running_loop().run_in_executor(None, resolve_doh, host)
+        for ip in ips:               # failover: 3.5s per IP, failed IP rotates to back of cache
+            try:
+                sr, sw = await asyncio.wait_for(asyncio.open_connection(ip, int(port)), 3.5)
+                break
+            except (OSError, asyncio.TimeoutError):
+                demote_ip(host, ip)
+        else:
+            raise ConnectionError(f"all {len(ips)} IPs failed for {host}")
         print(f"CONNECT {host}:{port} -> {ip}", flush=True)
-        sr, sw = await asyncio.wait_for(asyncio.open_connection(ip, int(port)), 15)
         sock = sw.get_extra_info("socket")
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        keepalive(sock)
+        keepalive(cw.get_extra_info("socket"))
         cw.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await cw.drain()
         first = await cr.read(16384)

@@ -9,7 +9,7 @@
 
 <hr>
 
-> Bản macOS này dựa trên dự án SteamAccessFix cho Windows của `vuviett47` (tham chiếu v1.2.0) và được phát triển độc lập.
+> Bản macOS này dựa trên dự án [SteamAccessFix](https://gitlab.com/vuviett47/SteamAccessFix) cho Windows của `vuviett47` (tham chiếu v1.2.0) và được phát triển độc lập.
 
 Tùy chọn dòng lệnh:
 
@@ -107,5 +107,5 @@ Báo lỗi tại [Issues](https://github.com/ezraphm/SteamAccessFix-macOS/issues
 ---
 
 <p align="center">
-  <b>Phiên bản hiện tại:</b> 0.1.2 &bull; <b>Gốc (Windows):</b> vuviett47 &bull; <b>Bản macOS:</b> <a href="https://github.com/ezraphm">ezraphm</a>
+  <b>Phiên bản hiện tại:</b> 0.1.2 &bull; <b>Gốc (Windows):</b> <a href="https://gitlab.com/vuviett47/SteamAccessFix">vuviett47</a> &bull; <b>Bản macOS:</b> <a href="https://github.com/ezraphm">ezraphm</a>
 </p>
