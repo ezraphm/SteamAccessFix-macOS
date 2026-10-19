@@ -4,13 +4,24 @@
 exec python3 "$0" "$@"
 '''
 """SteamAccessFix for macOS. Double-click or run: ./SteamAccessFix.command  (Ctrl-C restores everything).
-Recover after a hard kill: ./SteamAccessFix.command --restore"""
-import asyncio, json, os, re, signal, socket, struct, subprocess, sys, urllib.request
+Recover after a hard kill: ./SteamAccessFix.command --restore
+Keep system DNS: --nodns | DNS only, no proxy: --dns-only | Pick DNS: --dns google|cloudflare|quad9"""
+import asyncio, json, os, re, signal, socket, struct, subprocess, sys, time
 
-PROXY_PORT, PAC_PORT = 8787, 8788
-DOMAINS = ["steampowered.com", "steamcommunity.com", "steamstatic.com", "steamusercontent.com"]
-GOOGLE_DNS = ["8.8.8.8", "8.8.4.4"]
+PORT = 31627                      # one port: CONNECT proxy + PAC (GET /proxy.pac)
+PAC = ""
+DOMAINS = ["steampowered.com", "steamcommunity.com", "steamstatic.com", "steamusercontent.com",
+           "steam-chat.com", "steamgames.com", "steamcontent.com", "steamserver.net",
+           "counter-strike.net", "dota2.com", "valvesoftware.com"]
+DNS_SETS = {"google": ["8.8.8.8", "8.8.4.4"], "cloudflare": ["1.1.1.1", "1.0.0.1"], "quad9": ["9.9.9.9", "149.112.112.112"]}
 STATE = "/var/tmp/saf-state.json"
+KEEP_DNS = "--nodns" in sys.argv   # keep system DNS (static-IP / LAN setups)
+DNS_ONLY = "--dns-only" in sys.argv  # level 1: set DNS only, no proxy/PAC
+DNS_NAME = sys.argv[sys.argv.index("--dns") + 1] if "--dns" in sys.argv[:-1] else "google"
+if DNS_NAME not in DNS_SETS:
+    raise SystemExit(f"--dns must be one of: {', '.join(DNS_SETS)}")
+DNS_TTL = 900                      # upstream v1.1.5: 15 min cache, avoids mid-session drops
+_dns_cache = {}
 
 
 def sh(*args):
@@ -31,7 +42,7 @@ def save_state(svc):
     pac = sh("networksetup", "-getautoproxyurl", svc)
     url = re.search(r"URL: (\S+)", pac)
     on = re.search(r"Enabled: Yes", pac) is not None
-    st = {"svc": svc, "dns": [] if "aren't any" in dns else dns.split(),
+    st = {"svc": svc, "keep_dns": KEEP_DNS, "dns": [] if "aren't any" in dns else dns.split(),
           "pac_url": url.group(1) if url and url.group(1) != "(null)" else "", "pac_on": on}
     with open(STATE, "w") as f:
         json.dump(st, f)
@@ -42,7 +53,8 @@ def restore():
         return
     st = json.load(open(STATE))
     svc = st["svc"]
-    subprocess.run(["networksetup", "-setdnsservers", svc, *(st["dns"] or ["Empty"])])
+    if not st.get("keep_dns"):
+        subprocess.run(["networksetup", "-setdnsservers", svc, *(st["dns"] or ["Empty"])])
     if st["pac_url"]:
         subprocess.run(["networksetup", "-setautoproxyurl", svc, st["pac_url"]])
     subprocess.run(["networksetup", "-setautoproxystate", svc, "on" if st["pac_on"] else "off"])
@@ -57,8 +69,16 @@ def flush_dns():
 
 
 def resolve_doh(host):
+    hit = _dns_cache.get(host)
+    if hit and hit[1] > time.monotonic():
+        return hit[0]
+    ip = _resolve(host)
+    _dns_cache[host] = (ip, time.monotonic() + DNS_TTL)
+    return ip
+
+
+def _resolve(host):
     # Ask Google DNS over UDP (plain DNS, not DoH). Cloudflare DoH gave a dead IP for Steam.
-    # ponytail: no TTL/cache; add when reconnect churn matters.
     import random, struct as st
     q = st.pack(">HHHHHH", random.randint(0, 65535), 0x0100, 1, 0, 0, 0)
     for label in host.split("."):
@@ -124,18 +144,31 @@ async def handle(cr, cw):
     try:
         head = await cr.readuntil(b"\r\n\r\n")
         line = head.split(b"\r\n", 1)[0].decode(errors="replace")
+        if line.startswith("GET "):
+            cw.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\n"
+                     f"Content-Length: {len(PAC)}\r\nConnection: close\r\n\r\n{PAC}".encode())
+            await cw.drain()
+            cw.close()
+            return
         if not line.startswith("CONNECT "):
             cw.write(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\n\r\n")
             return
         host, _, port = line.split()[1].rpartition(":")
         ip = await asyncio.get_running_loop().run_in_executor(None, resolve_doh, host)
         print(f"CONNECT {host}:{port} -> {ip}", flush=True)
-        sr, sw = await asyncio.open_connection(ip, int(port))
+        sr, sw = await asyncio.wait_for(asyncio.open_connection(ip, int(port)), 15)
         sock = sw.get_extra_info("socket")
         sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         cw.write(b"HTTP/1.1 200 Connection Established\r\n\r\n")
         await cw.drain()
         first = await cr.read(16384)
+        if first[:1] == b"\x16" and len(first) >= 5:   # read whole TLS record, not one TCP segment (MSS 1460)
+            need = 5 + int.from_bytes(first[3:5], "big")
+            while len(first) < need:
+                more = await asyncio.wait_for(cr.read(need - len(first)), 15)
+                if not more:
+                    break
+                first += more
         span = sni_span(first)
         if span:                     # split ClientHello after TLS record header (DPI evasion)
             cut = 5                  # ponytail: mid-SNI cut gets RST on some ISPs; this one passes. Make configurable if an ISP needs otherwise.
@@ -149,37 +182,29 @@ async def handle(cr, cw):
         cw.close()
 
 
-async def pac_server(pac):
-    async def h(r, w):
-        try:
-            await r.readuntil(b"\r\n\r\n")
-            w.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\n"
-                    f"Content-Length: {len(pac)}\r\nConnection: close\r\n\r\n{pac}".encode())
-            await w.drain()
-        except (asyncio.IncompleteReadError, ConnectionError, OSError):
-            pass  # client closed early (browser probes); not an error
-        finally:
-            w.close()
-    return await asyncio.start_server(h, "127.0.0.1", PAC_PORT)
-
-
 async def main():
     if os.geteuid() != 0:
         raise SystemExit("run with sudo")
     svc = active_service()
-    cond = " || ".join(f'dnsDomainIs(host,"{d}")' for d in DOMAINS)
-    pac = (f'function FindProxyForURL(url, host) {{ if ({cond}) '
-           f'return "PROXY 127.0.0.1:{PROXY_PORT}"; return "DIRECT"; }}')
-    # bind first: a failed bind must not clobber a running instance's state file
-    srv = await asyncio.start_server(handle, "127.0.0.1", PROXY_PORT)
-    pacs = await pac_server(pac)
+    # bind first: a failed bind must not clobber a running instance's state file (port is the instance lock)
+    global PAC
+    if not DNS_ONLY:
+        cond = " || ".join(f'dnsDomainIs(host,"{d}")' for d in DOMAINS)
+        PAC = (f'function FindProxyForURL(url, host) {{ if ({cond}) '
+               f'return "PROXY 127.0.0.1:{PORT}; DIRECT"; return "DIRECT"; }}')
+        srv = await asyncio.start_server(handle, "127.0.0.1", PORT)
     save_state(svc)
     try:
-        subprocess.run(["networksetup", "-setdnsservers", svc, *GOOGLE_DNS], check=True)
-        flush_dns()
-        subprocess.run(["networksetup", "-setautoproxyurl", svc, f"http://127.0.0.1:{PAC_PORT}/proxy.pac"], check=True)
-        subprocess.run(["networksetup", "-setautoproxystate", svc, "on"], check=True)
-        print(f"on: {svc}. DNS=Google, PAC=127.0.0.1:{PAC_PORT}, proxy=127.0.0.1:{PROXY_PORT}. Ctrl-C to restore.", flush=True)
+        if not KEEP_DNS:
+            subprocess.run(["networksetup", "-setdnsservers", svc, *DNS_SETS[DNS_NAME]], check=True)
+            flush_dns()
+        dns = "kept" if KEEP_DNS else DNS_NAME
+        if DNS_ONLY:
+            print(f"on: {svc}. DNS={dns}, no proxy. Ctrl-C to restore.", flush=True)
+        else:
+            subprocess.run(["networksetup", "-setautoproxyurl", svc, f"http://127.0.0.1:{PORT}/proxy.pac"], check=True)
+            subprocess.run(["networksetup", "-setautoproxystate", svc, "on"], check=True)
+            print(f"on: {svc}. DNS={dns}, PAC+proxy=127.0.0.1:{PORT}. Ctrl-C to restore.", flush=True)
         await asyncio.Future()
     finally:
         restore()
